@@ -13,6 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 from typing import Union, AsyncGenerator, AsyncContextManager, Dict, Optional, List
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthori
 from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import (Document, InputFileLocation, InputDocumentFileLocation,
                                InputPhotoFileLocation, InputPeerPhotoFileLocation, DcOption)
-from telethon.errors import DcIdInvalidError
+from telethon.errors import DcIdInvalidError, FloodWaitError
 
 from .config import connection_limit
 
@@ -165,16 +166,25 @@ class ParallelTransferrer:
             async with dcm.get_connection() as conn:
                 log = conn.log
                 while part <= last_part:
-                    result = await conn.sender.send(request)
-                    request.offset += part_size
-                    if part == first_part:
-                        yield result.bytes[first_part_cut:]
-                    elif part == last_part:
-                        yield result.bytes[:last_part_cut]
-                    else:
-                        yield result.bytes
-                    log.debug(f"Part {part}/{last_part} (total {part_count}) downloaded")
-                    part += 1
+                    try:
+                        result = await conn.sender.send(request)
+                        request.offset += part_size
+                        if part == first_part:
+                            yield result.bytes[first_part_cut:]
+                        elif part == last_part:
+                            yield result.bytes[:last_part_cut]
+                        else:
+                            yield result.bytes
+                        log.debug(f"Part {part}/{last_part} (total {part_count}) downloaded")
+                        part += 1
+                    except FloodWaitError as e:
+                        wait_seconds = int(e.seconds)
+                        if wait_seconds > 25:
+                            raise
+                        log.debug(f"Flood Wait: sleeping for {wait_seconds}s")
+                        await asyncio.sleep(wait_seconds)
+                    except:
+                        raise
                 log.debug("Parallel download finished")
         except (GeneratorExit, StopAsyncIteration, asyncio.CancelledError):
             log.debug("Parallel download interrupted")
@@ -185,7 +195,7 @@ class ParallelTransferrer:
     def download(self, file: TypeLocation, file_size: int, offset: int, limit: int
                  ) -> AsyncGenerator[bytes, None]:
         dc_id, location = utils.get_input_location(file)
-        part_size = 512 * 1024
+        part_size = 1024 * 1024
         first_part_cut = offset % part_size
         first_part = math.floor(offset / part_size)
         last_part_cut = part_size - (limit % part_size)
